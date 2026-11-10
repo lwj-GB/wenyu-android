@@ -1,0 +1,434 @@
+package app.resound.capture
+
+import android.app.*
+import android.content.Intent
+import app.resound.AppGraph
+import android.content.pm.ServiceInfo
+import android.os.IBinder
+import android.os.PowerManager
+import android.os.SystemClock
+import androidx.core.app.NotificationManagerCompat
+import app.resound.ResoundApp
+import app.resound.audio.*
+import app.resound.data.HeartbeatEntity
+import app.resound.data.AppPowerEntity
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.UUID
+import java.util.concurrent.Executors
+
+/** 一个串行调度器管理命令/状态/心跳，麦克风读取和文件编码各自使用 IO。 */
+class CaptureService : Service() {
+    private val dispatcher = Executors.newSingleThreadExecutor { r -> Thread(r, "capture-state") }.asCoroutineDispatcher()
+    private val scope = CoroutineScope(SupervisorJob() + dispatcher)
+    private data class Command(val intent: Intent, val completion: CompletableDeferred<Unit>? = null)
+    private val commands = Channel<Command>(Channel.UNLIMITED)
+    private var discardOnFinish = false
+    private val app get() = application as ResoundApp
+    private val store get() = app.store
+    private val holders by lazy { MicHolderGuess(this) }
+    private val controller get() = app.controller
+    private var capture: Job? = null
+    private var resumeTimer: Job? = null
+    private var heartbeat: Job? = null
+    private var lastLiveNotificationAt = 0L
+    private var initialized = false
+    private var normalStop = false
+    private val beatMutex = Mutex()
+    private var intervalStart = 0L
+    private var state = CaptureState.Stopped
+    private val session = UUID.randomUUID().toString()
+    private val micClock = MicOpenClock(SystemClock::elapsedRealtime)
+    private val chargeEpoch = java.util.concurrent.atomic.AtomicLong(0)
+    private val powerReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: android.content.Context?, intent: Intent?) { chargeEpoch.incrementAndGet() }
+    }
+    private suspend fun samplePower() {
+        val epoch = chargeEpoch.get()
+        val (percent, charging) = store.battery()
+        val charge = getSystemService(android.os.BatteryManager::class.java)
+            .getLongProperty(android.os.BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)
+        store.dao.appPower(AppPowerEntity(
+            at = System.currentTimeMillis(), elapsedMs = SystemClock.elapsedRealtime(), session = session,
+            cpuMs = android.os.Process.getElapsedCpuTime(),
+            txBytes = android.net.TrafficStats.getUidTxBytes(android.os.Process.myUid()),
+            rxBytes = android.net.TrafficStats.getUidRxBytes(android.os.Process.myUid()),
+            micMs = micClock.totalMillis(), charging = charging.takeIf { epoch == chargeEpoch.get() }, chargeEpoch = epoch,
+            capacityMah = AppPowerModel.capacityMah(charge, percent)))
+    }
+    private var wakeLock: PowerManager.WakeLock? = null
+    private lateinit var playback: PlaybackMonitor
+
+    override fun onCreate() {
+        super.onCreate()
+        alive = true
+        instance = this
+        playback = PlaybackMonitor(this)
+        registerReceiver(powerReceiver, android.content.IntentFilter().apply {
+            addAction(Intent.ACTION_POWER_CONNECTED); addAction(Intent.ACTION_POWER_DISCONNECTED)
+        })
+        scope.launch {
+            try { for (command in commands) {
+                try { handle(command.intent); command.completion?.complete(Unit) }
+                catch (e: Exception) { command.completion?.completeExceptionally(e); throw e }
+            } }
+            catch (e: Exception) {
+                if (e is CancellationException) throw e
+                fail("服务异常：${e.javaClass.simpleName}: ${e.message}")
+            }
+        }
+    }
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent == null && !store.prefs.getBoolean("enabled", false)) {
+            normalStop = true
+            stopSelf(); return START_NOT_STICKY
+        }
+        val command = intent ?: Intent().setAction(START).putExtra("route", "system-sticky")
+        // 停止也不创建新的录音会话。
+        if (command.action == STOP) { commands.trySend(Command(command)); return START_NOT_STICKY }
+        if (!CaptureNotifications.permitted(this)) {
+            controller.update(CaptureState.NoPermission)
+            stopSelf(); return START_NOT_STICKY
+        }
+        try {
+            startForegroundWithLocation()
+        } catch (_: RuntimeException) {
+            controller.update(CaptureState.NoPermission)
+            CaptureNotifications.interrupted(this)
+            stopSelf(); return START_NOT_STICKY
+        }
+        commands.trySend(Command(command))
+        return START_STICKY
+    }
+    private suspend fun handle(intent: Intent) {
+        if (intent.action == RECHECK && (!initialized || !store.prefs.getBoolean("enabled", false))) return
+        if (intent.action == DISCARD_CURRENT) {
+            val wasCapturing = capture?.isActive == true
+            discardOnFinish = true
+            try { capture?.cancelAndJoin(); capture = null }
+            finally { discardOnFinish = false }
+            // 只换录音协程，服务、心跳、暂停计时均不重启。
+            if (wasCapturing) { releaseWakeLock(); resumeCapture() }
+            return
+        }
+        if (intent.action == STOP) {
+            capture?.cancelAndJoin(); capture = null
+            resumeTimer?.cancel(); cancelAlarm()
+            if (initialized) {
+                beat()
+                samplePower()
+                store.event(WatchdogEventType.ServiceStopped, "用户正常停止")
+            }
+            normalStop = true
+            store.prefs.edit().putBoolean("enabled", false).putBoolean("unclean", false).putLong("pausedUntil", 0).putLong("manualPausedUntil", 0).remove("quietName").commit()
+            transition(CaptureState.Stopped)
+            heartbeat?.cancel()
+            releaseWakeLock()
+            stopLocation()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            NotificationManagerCompat.from(this).cancel(CaptureNotifications.INTERRUPTED)
+            stopSelf(); return
+        }
+        if (!initialized) {
+            val now = System.currentTimeMillis()
+            if (store.prefs.getBoolean("unclean", false)) {
+                val lastHeartbeat = store.prefs.getLong("heartbeat", now).coerceAtMost(now)
+                val gaps = QuietRules.recordingGaps(app.quietSchedule.rules.value, lastHeartbeat, now,
+                    java.time.ZoneId.systemDefault(), store.prefs.getLong("manualPausedUntil", 0), store.prefs.getLong("quietSkipUntil", 0))
+                for ((from, to) in gaps) store.event(WatchdogEventType.Killed, "上次未正常停止；排除暂停后缺口约 ${to - from}ms（上界估计）", from, to)
+                store.event(WatchdogEventType.Recovered, "恢复途径=${intent.getStringExtra("route") ?: "unknown"}")
+            }
+            store.prefs.edit().putBoolean("enabled", true).putBoolean("unclean", true).putLong("heartbeat", now).commit()
+            initialized = true; intervalStart = now
+            store.event(WatchdogEventType.ServiceStarted, "启动途径=${intent.getStringExtra("route")}")
+            store.sampleBattery(); samplePower()
+            CaptureWatchdog.schedule(this)
+            heartbeat = scope.launch {
+                var batteryAt = SystemClock.elapsedRealtime()
+                while (isActive) {
+                    delay(CaptureTuning.HEARTBEAT_MS); beat()
+                    commands.send(Command(Intent().setAction(RECHECK)))
+                    if (SystemClock.elapsedRealtime() - batteryAt >= CaptureTuning.BATTERY_MS) {
+                        store.sampleBattery(); samplePower(); batteryAt = SystemClock.elapsedRealtime()
+                    }
+                }
+            }
+        }
+        NotificationManagerCompat.from(this).cancel(CaptureNotifications.INTERRUPTED)
+        when (intent.action) {
+            PAUSE -> {
+                val until = System.currentTimeMillis() + intent.getIntExtra("minutes", 60).coerceIn(1, 10080).toLong() * 60_000
+                store.prefs.edit().putLong("manualPausedUntil", until).commit()
+                reconcilePause()
+            }
+            RESUME -> {
+                store.prefs.edit().putLong("manualPausedUntil", 0).commit()
+                app.quietSchedule.resume()
+                reconcilePause()
+            }
+            else -> reconcilePause()
+        }
+    }
+    private suspend fun reconcilePause() {
+        val plan = capturePausePlan(System.currentTimeMillis(), store.prefs.getLong("manualPausedUntil", 0), app.quietSchedule.refresh())
+        if (plan != null) pauseUntil(plan.until, plan.quietName)
+        else if (playbackHeld) {
+            capture?.cancelAndJoin(); capture = null
+            releaseWakeLock()
+            // 临时让麦仍属于服务正常运行：不记手动暂停、MicBusy 或漏录。
+            transition(CaptureState.Listening)
+            refreshNotification(false)
+        } else resumeCapture()
+    }
+    private suspend fun pauseUntil(until: Long, quietName: String? = null) {
+        val old = controller.status.value
+        if (state == CaptureState.Paused && old.pausedUntil == until && old.quietName == quietName) { refreshNotification(true); return }
+        capture?.cancelAndJoin(); capture = null
+        resumeTimer?.cancel()
+        transition(CaptureState.Paused, until, quietName = quietName)
+        releaseWakeLock()
+        store.prefs.edit().putLong("pausedUntil", until).putString("quietName", quietName).commit()
+        val clock = java.time.Instant.ofEpochMilli(until).atZone(java.time.ZoneId.systemDefault()).format(java.time.format.DateTimeFormatter.ofPattern("HH:mm"))
+        store.event(WatchdogEventType.Paused, if (quietName == null) "暂停至 $until" else "停录时段：$quietName，至 $clock")
+        val manager = getSystemService(AlarmManager::class.java)
+        if (until != Long.MAX_VALUE) {
+            try {
+                if (android.os.Build.VERSION.SDK_INT < 31 || manager.canScheduleExactAlarms()) manager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, until, alarmIntent())
+                else manager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, until, alarmIntent())
+            } catch (_: SecurityException) { manager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, until, alarmIntent()) }
+        }
+        resumeTimer = scope.launch { delay((until - System.currentTimeMillis()).coerceAtLeast(0)); commands.send(Command(Intent().setAction(RECHECK).putExtra("route", "pause-timer"))) }
+        refreshNotification(true)
+    }
+    private suspend fun resumeCapture() {
+        if (playbackHeld) return
+        val wasPaused = state == CaptureState.Paused || store.prefs.getLong("pausedUntil", 0) > 0
+        resumeTimer?.cancel(); resumeTimer = null; cancelAlarm()
+        store.prefs.edit().putLong("pausedUntil", 0).putLong("manualPausedUntil", 0).remove("quietName").commit()
+        if (wasPaused) store.event(WatchdogEventType.Resumed, "暂停结束或用户恢复")
+        if (capture?.isActive == true) return
+        wakeLock = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "resound:capture").apply { acquire() }
+        transition(CaptureState.Listening)
+        lastLiveNotificationAt = 0L
+        refreshNotification(false)
+        capture = scope.launch {
+            try { listen() }
+            catch (e: Exception) {
+                if (e is CancellationException) throw e
+                fail("录音收尾异常：${e.javaClass.simpleName}: ${e.message}")
+            }
+        }
+    }
+    private suspend fun listen() {
+        app.segmentFiles.awaitReady()
+        InputSwitchLoop(app.inputs.snapshots, SystemClock::elapsedRealtime).run(onUnchanged = { route, note ->
+            if (app.inputs.status.value.using.key == route.device.key) app.inputs.report(route.device, note)
+        }) { route, note ->
+            listenTo(route, note)
+        }
+    }
+    private suspend fun listenTo(route: InputRoute, note: String?) {
+        var busy = false
+        var busyDetail: String? = null
+        var reported = false
+        while (currentCoroutineContext().isActive) {
+            var segmenter: SpeechSegmenter? = null
+            try {
+                val source: AudioSource = if (route.device.kind == InputKind.Phone) MicAudioSource(this, micClock::setOpen)
+                else ExternalAudioSource(this, route.device,
+                    app.inputs.port(requireNotNull(route.portId))
+                        ?: throw AudioSourceException(AudioSourceException.Reason.Disconnected), micClock::setOpen)
+                val sensitivity = VadSensitivity.forInput(route.device.kind)
+                SileroVad(this, sensitivity).use { vad ->
+                    var levelAt = 0L
+                    var levelPeak = 0f
+                    var diagnosticAt = SystemClock.elapsedRealtime()
+                    var diagnosticPeak = 0f
+                    var speechSamples = 0L
+                    source.events().collect { event ->
+                        when (event) {
+                            is AudioEvent.Busy -> {
+                                // 让出麦克风期间：正在录的片段按正常结束收尾，恢复后从新片段开始计时
+                                segmenter?.finish(); segmenter = null
+                                if (!busy) {
+                                    // 被占的那一刻猜一次；之后前台换了也不重猜，免得猜成后来打开的应用
+                                    busyDetail = if (event.reason == MicYield.OTHER_APP) holders.describe() ?: event.reason else event.reason
+                                    store.event(WatchdogEventType.MicBusy, if (busyDetail == event.reason) event.reason else "${event.reason}；$busyDetail")
+                                    busy = true
+                                }
+                                controller.level(0f)
+                                transition(CaptureState.MicBusy, detail = busyDetail)
+                                return@collect
+                            }
+                            AudioEvent.Available -> {
+                                if (busy) { store.event(WatchdogEventType.MicReleased); busy = false }
+                                transition(CaptureState.Listening)
+                                return@collect
+                            }
+                            is AudioEvent.Frame -> Unit
+                        }
+                        if (!reported) {
+                            val previous = app.inputs.status.value.using
+                            app.inputs.report(route.device, note)
+                            if (previous.key != route.device.key || note != null)
+                                store.inputSwitched("${previous.name} → ${route.device.name}；${note ?: "录音输入切换"}")
+                            reported = true
+                        }
+                        val frame = (event as AudioEvent.Frame).samples
+                        val frameAt = System.currentTimeMillis()
+                        if (busy) { store.event(WatchdogEventType.MicReleased); busy = false }
+                        val cutter = segmenter ?: SpeechSegmenter(app.segmentFiles.sink(
+                            System.currentTimeMillis() - frame.size * 1000L / AudioSource.SAMPLE_RATE, source.id, sensitivity.minSpeechSamples),
+                            sensitivity.minSpeechSamples).also { segmenter = it }
+                        vad.accept(frame) { pcm, speech, level ->
+                            cutter.accept(pcm, speech, playback.speakerPlaying)
+                            val next = if (cutter.active) CaptureState.Recording else CaptureState.Listening
+                            // 状态和采样在此线程串行；人声状态切换不改变 running 区间。
+                            if (state != next) { state = next; controller.update(next) }
+                            val elapsed = SystemClock.elapsedRealtime()
+                            if (sensitivity.boostDetection) {
+                                diagnosticPeak = maxOf(diagnosticPeak, level)
+                                if (speech) speechSamples += pcm.size
+                                if (elapsed - diagnosticAt >= 10_000) {
+                                    android.util.Log.i("MicSensitivity", "kind=${route.device.kind} peakRms=${String.format(java.util.Locale.US, "%.6f", diagnosticPeak)} speechMs=${speechSamples * 1000 / AudioSource.SAMPLE_RATE}")
+                                    diagnosticAt = elapsed; diagnosticPeak = 0f; speechSamples = 0
+                                }
+                            }
+                            levelPeak = maxOf(levelPeak, level)
+                            // 每 50 毫秒报一次这段时间里的最大音量，界面据此画真实波形
+                            if (elapsed - levelAt >= 50) { controller.audioFrame(levelPeak, frameAt); levelPeak = 0f; levelAt = elapsed }
+                            // 复用真实帧回调，最多每 30 秒刷新一次通知，不为通知额外唤醒设备。
+                            if (lastLiveNotificationAt == 0L || elapsed - lastLiveNotificationAt >= 30_000L) {
+                                lastLiveNotificationAt = elapsed
+                                refreshNotification(false)
+                            }
+                        }
+                    }
+                }
+            } catch (e: AudioSourceException) {
+                // 外接失败立即交调度器切手机；蓝牙缺权限也不应停止手机录音。
+                if (route.device.kind != InputKind.Phone) throw e
+                if (e.reason == AudioSourceException.Reason.NoPermission) {
+                    transition(CaptureState.NoPermission)
+                    fail("麦克风权限被撤销")
+                    awaitCancellation()
+                }
+                if (!busy) { store.event(WatchdogEventType.MicBusy, "${e.reason}: ${e.message}"); busy = true }
+                transition(CaptureState.MicBusy)
+            } catch (e: Exception) {
+                // 外接设备的意外错误也只换回手机，不停整个录音
+                if (e is CancellationException || route.device.kind == InputKind.Phone) throw e
+                throw AudioSourceException(AudioSourceException.Reason.Unknown, "${e.javaClass.simpleName}: ${e.message}")
+            } finally {
+                if (discardOnFinish) segmenter?.discard() else segmenter?.finish()
+                controller.level(0f)
+            }
+            delay(CaptureTuning.MIC_RETRY_MS)
+        }
+    }
+    private fun running(s: CaptureState) = s == CaptureState.Listening || s == CaptureState.Recording || s == CaptureState.MicBusy
+    private suspend fun transition(next: CaptureState, until: Long? = null, detail: String? = null, quietName: String? = null) {
+        val previous = state
+        if (initialized && running(state) != running(next)) beat()
+        state = next; controller.update(next, until, busyDetail = detail, quietName = quietName)
+        if (previous != next && (previous == CaptureState.MicBusy || next == CaptureState.MicBusy || next == CaptureState.NoPermission))
+            refreshNotification(next == CaptureState.Paused)
+    }
+    private suspend fun beat() = beatMutex.withLock {
+        val now = System.currentTimeMillis()
+        store.dao.heartbeat(HeartbeatEntity(at = now, intervalStart = minOf(intervalStart, now), running = running(state), session = session))
+        intervalStart = now
+        store.prefs.edit().putLong("heartbeat", now).commit()
+        refreshNotification(state == CaptureState.Paused)
+    }
+    private suspend fun fail(detail: String) {
+        if (initialized) { beat(); store.event(WatchdogEventType.ServiceStopped, "$detail；等待手动恢复，保留未正常停止标记") }
+        if (state != CaptureState.NoPermission) { state = CaptureState.Stopped; controller.update(state) }
+        releaseWakeLock(); heartbeat?.cancel()
+        CaptureNotifications.interrupted(this)
+        stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
+    }
+    private fun plannedPause() = capturePausePlan(System.currentTimeMillis(), store.prefs.getLong("manualPausedUntil", 0), app.quietSchedule.refresh()) != null
+    private fun alarmIntent() = PendingIntent.getBroadcast(this, 10, Intent(this, CaptureResumeReceiver::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+    private fun cancelAlarm() { getSystemService(AlarmManager::class.java).cancel(alarmIntent()) }
+    private fun refreshNotification(paused: Boolean) {
+        if (!CaptureNotifications.permitted(this)) return
+        try { NotificationManagerCompat.from(this).notify(CaptureNotifications.ONGOING, CaptureNotifications.ongoing(this, paused, controller.status.value)) }
+        catch (_: SecurityException) { /* 检查后权限被撤回；不能让通知刷新中断录音收尾。 */ }
+    }
+    /** 定位权限/后台限制不能阻止既有收音。 */
+    private fun startForegroundWithLocation() {
+        val notification = CaptureNotifications.ongoing(this, store.prefs.getLong("pausedUntil", 0) > System.currentTimeMillis(), controller.status.value)
+        val location = if (AppGraph.isLocationReady) AppGraph.location else null
+        var tracking = false
+        if (location?.settings?.wanted() == true) {
+            try {
+                startForeground(CaptureNotifications.ONGOING, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+                tracking = true
+            } catch (_: RuntimeException) { }
+        }
+        if (!tracking) startForeground(CaptureNotifications.ONGOING, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        if (tracking) location?.tracker?.start() else location?.tracker?.stop()
+    }
+    private fun stopLocation() { if (AppGraph.isLocationReady) AppGraph.location.tracker.stop() }
+    private fun releaseWakeLock() { wakeLock?.let { if (it.isHeld) it.release() }; wakeLock = null }
+    override fun onDestroy() {
+        alive = false
+        instance = null
+        commands.close()
+        while (true) {
+            val pending = commands.tryReceive().getOrNull() ?: break
+            pending.completion?.completeExceptionally(CancellationException("录音服务已停止"))
+        }
+        playback.close()
+        stopLocation()
+        unregisterReceiver(powerReceiver)
+        if (!normalStop && controller.status.value.state != CaptureState.NoPermission) controller.update(CaptureState.Stopped)
+        scope.cancel(); dispatcher.close(); releaseWakeLock()
+        if (!normalStop && initialized && !plannedPause()) CaptureNotifications.interrupted(this)
+        super.onDestroy()
+    }
+    override fun onBind(intent: Intent?): IBinder? = null
+    companion object {
+        @Volatile private var playbackHeld = false
+        internal fun playbackHold(held: Boolean) {
+            playbackHeld = held
+            recheck()
+        }
+        /** 播放器等待录音协程的 finally 完成，包含 SCO 路由和通信模式释放。 */
+        internal suspend fun awaitPlaybackRelease() {
+            val service = instance ?: return
+            if (!playbackHeld) return
+            val done = CompletableDeferred<Unit>()
+            service.commands.send(Command(Intent().setAction(RECHECK), done))
+            done.await()
+        }
+        private const val DISCARD_CURRENT = "app.resound.capture.DISCARD_CURRENT"
+        @Volatile private var instance: CaptureService? = null
+        /** 进程内动作，未运行时直接返回，不启动服务。 */
+        internal suspend fun discardCurrent() {
+            val service = instance ?: return
+            val done = CompletableDeferred<Unit>()
+            service.commands.send(Command(Intent().setAction(DISCARD_CURRENT), done))
+            done.await()
+        }
+        const val RECHECK = "app.resound.capture.RECHECK"
+        /** 规则改动、心跳和系统广播只通知已有服务，绝不在后台新建麦克风前台服务。 */
+        /** 课堂模式开关或到点后刷新常驻通知的文字与按钮 */
+        internal fun refreshOngoing() { instance?.let { it.refreshNotification(it.store.prefs.getLong("pausedUntil", 0) > System.currentTimeMillis()) } }
+        /** 仅刷新已运行的服务；不会为了足迹在后台启动麦克风。 */
+        fun refreshLocation() {
+            val service = instance ?: return
+            try { service.startForegroundWithLocation() } catch (_: RuntimeException) { service.stopLocation() }
+        }
+        internal fun recheck() { instance?.commands?.trySend(Command(Intent().setAction(RECHECK))) }
+        const val START = "app.resound.capture.START"
+        const val STOP = "app.resound.capture.STOP"
+        const val PAUSE = "app.resound.capture.PAUSE"
+        const val RESUME = "app.resound.capture.RESUME"
+        @Volatile var alive = false
+            private set
+    }
+}

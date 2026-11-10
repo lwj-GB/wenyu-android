@@ -1,0 +1,36 @@
+{
+  "upstream": "https://github.com/0xCoach/TaoSheng",
+  "commit": "23907c46415828342b51a296332dd97db25243c4",
+  "license": "MIT; model and native assets retain their own licenses",
+  "fork": "Wenyu Android (Lingxi Bridge)",
+  "date": "2026-11-10",
+  "integration": {
+    "reviewed_upstream_commit": "4aad772a15b956d0585da833324c42bb84ca2773",
+    "upstream_version": "0.2.21",
+    "date": "2026-11-10",
+    "features": [
+      "location and place labels",
+      "location/environment situation lookup and opt-in digest context",
+      "personal ask by place"
+    ],
+    "source_commits": [
+      "6274a0d93457ff8a9f856ed61035edcb75e57ea6",
+      "0793e3db7566f8fc5b01da2ad3461574b1f11733",
+      "712bdbe3e6a7949d519ee8ba1bca64a9c09bc457",
+      "79275ec6b3c7b766858ae73e08d658794edfb3b4"
+    ],
+    "database_version": 30,
+    "full_upstream_merge": false,
+    "local_rules": [
+      "home requires user label",
+      "location gaps over 20 minutes split stays"
+    ]
+  },
+  "distribution": {
+    "version": "0.1.3",
+    "snapshot": true,
+    "source_commit": "2eb519e1e8a82525c9e8395e86d75003ab1c22b1",
+    "working_tree_changes_included": true,
+    "private_documents_included": false
+  }
+}

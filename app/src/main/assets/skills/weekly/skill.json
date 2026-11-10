@@ -1,0 +1,53 @@
+{
+  "formatVersion": 1,
+  "id": "weekly",
+  "name": "每周回顾",
+  "summary": "按主题回看本周进展、未完事项与下周安排",
+  "icon": "calendar_week",
+  "version": 3,
+  "trigger": {
+    "type": "Daily",
+    "minutes": 1260,
+    "weekdays": [
+      7
+    ]
+  },
+  "scope": {
+    "range": "Week",
+    "speakers": "All",
+    "includeLines": false
+  },
+  "fields": [
+    {
+      "key": "one_line",
+      "label": "这周一句话",
+      "type": "Text",
+      "hint": "客观概括本周有依据的主线",
+      "required": true
+    },
+    {
+      "key": "highlights",
+      "label": "本周进展",
+      "type": "Bullets",
+      "hint": "按主题合并同一事项的多次记录，最多3个重点，写清本周变化与结果；用户标星的事项优先纳入，不逐事件罗列",
+      "required": false
+    },
+    {
+      "key": "todo_review",
+      "label": "还挂着的事",
+      "type": "Bullets",
+      "hint": "只列未完成且需继续跟进的事项，合并重复记录；已完成的放入本周进展",
+      "required": false
+    },
+    {
+      "key": "next_week",
+      "label": "下周留意",
+      "type": "Bullets",
+      "hint": "只写已有计划和确需继续跟进的事项",
+      "required": false
+    }
+  ],
+  "maxCardsPerDay": 1,
+  "push": true,
+  "order": 2
+}

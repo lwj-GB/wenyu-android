@@ -1,0 +1,42 @@
+package app.resound.data
+
+import androidx.room.*
+
+@Entity(tableName = "privacy_file_cleanup")
+data class PrivacyFileCleanup(@PrimaryKey val path: String)
+
+@Dao
+interface PrivacyDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun queueCleanup(row: PrivacyFileCleanup)
+    @Transaction
+    @Query("SELECT * FROM privacy_file_cleanup") suspend fun pendingCleanup(): List<PrivacyFileCleanup>
+    @Query("DELETE FROM privacy_file_cleanup WHERE path = :path") suspend fun cleaned(path: String)
+    @Query("SELECT * FROM segments WHERE startAt >= :from AND startAt <= :until")
+    suspend fun recent(from: Long, until: Long): List<SegmentEntity>
+    @Query("SELECT * FROM segments WHERE id = :id")
+    suspend fun segment(id: Long): SegmentEntity?
+    @Query("SELECT DISTINCT s.* FROM segments s JOIN transcript_lines l ON l.segmentId = s.id WHERE l.eventId = :id")
+    suspend fun eventSegments(id: Long): List<SegmentEntity>
+    @Query("DELETE FROM memory_items WHERE lineId IN (SELECT id FROM transcript_lines WHERE segmentId = :id)")
+    suspend fun deleteLineItems(id: Long): Int
+    @Query("DELETE FROM memory_items WHERE eventId = :id")
+    suspend fun deleteEventItems(id: Long): Int
+    @Query("DELETE FROM memory_items WHERE lineId = :id")
+    suspend fun deleteLineItemsById(id: Long): Int
+    @Query("DELETE FROM transcript_lines WHERE id = :id")
+    suspend fun deleteLine(id: Long): Int
+    @Query("DELETE FROM embeddings WHERE kind = 'line' AND refId IN (SELECT id FROM transcript_lines WHERE segmentId = :id)")
+    suspend fun deleteLineVectors(id: Long)
+    @Query("DELETE FROM transcript_lines WHERE segmentId = :id")
+    suspend fun deleteLines(id: Long): Int
+    @Query("DELETE FROM voiceprint_samples WHERE segmentId = :id OR sourceLineId IN (SELECT id FROM transcript_lines WHERE segmentId = :id)")
+    suspend fun deleteSamples(id: Long)
+    @Query("DELETE FROM voiceprint_exclusions WHERE segmentId = :id")
+    suspend fun deleteExclusions(id: Long)
+    @Query("DELETE FROM segments WHERE id = :id")
+    suspend fun deleteSegment(id: Long): Int
+    @Query("SELECT COUNT(*) FROM transcript_lines WHERE eventId = :id")
+    suspend fun eventLineCount(id: Long): Int
+    @Query("DELETE FROM memory_events WHERE id = :id")
+    suspend fun deleteEvent(id: Long): Int
+}
