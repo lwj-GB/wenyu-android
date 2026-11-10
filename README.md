@@ -2,7 +2,7 @@
 
 用来记录、回顾和整理日常资料的 Android App。可以查原话、整理记忆和待办，也可以围绕自己提供的人物与事件资料提问、阅读报告。
 
-[下载 Android 版](https://github.com/lwj-GB/wenyu-android/releases/latest) · [桌面工作台](https://github.com/lwj-GB/lingxi-bridge) · [使用说明](docs/使用指南.md) · [问题反馈](https://github.com/lwj-GB/wenyu-android/issues)
+[下载 Android 版](https://github.com/lwj-GB/wenyu-android/releases/tag/v0.1.3) · [桌面工作台](https://github.com/lwj-GB/lingxi-bridge) · [使用说明](docs/使用指南.md) · [问题反馈](https://github.com/lwj-GB/wenyu-android/issues)
 
 - 个人记录：录音、转写、记忆、问问和待办。
 - 人物与事件：建档、补充资料、问答、报告和原句核对。
